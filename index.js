@@ -2,8 +2,14 @@ const express = require("express");
 const fs = require("fs");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const Web3 = require("web3");
-const web3 = new Web3(new Web3.providers.HttpProvider("Geth Instance"));
+// const Web3 = require("web3");
+// const web3 = new Web3(new Web3.providers.HttpProvider("Geth Instance"));
+
+const Web3 = require('web3');
+
+// // any eth-rpc-url you own or have access to
+const HTTP_PROVIDER = 'http://58.115.23.124:8545';
+const web3 = new Web3(new Web3.providers.HttpProvider(HTTP_PROVIDER));
 
 const compression = require("compression");
 
@@ -11,7 +17,7 @@ const { spawn } = require("child_process");
 const graphene = require("graphene-pk11");
 //var util = require('ethereumjs-util')
 const keccak256 = require("js-sha3").keccak256;
-const EthereumTx = require("ethereumjs-tx").Transaction;
+const EthereumTx = require('ethereumjs-tx').Transaction;
 const BigNumber = require("bignumber.js");
 const util = require("ethereumjs-util");
 
@@ -25,7 +31,7 @@ const slot = mod.getSlots(0);
 const session = slot.open(
   graphene.SessionFlag.RW_SESSION | graphene.SessionFlag.SERIAL_SESSION
 );
-session.login("12345");
+session.login("1234");
 
 //--------------------------------------------------------------
 // Express server configuration
@@ -57,6 +63,24 @@ app.get("/tx_builder.html", (req, res) =>
 app.get("/keyslist.html", (req, res) =>
   res.sendFile(__dirname + "/keyslist.html")
 );
+
+async function getLastTransactions(address, count) {
+  let latestBlock = await web3.eth.getBlockNumber();
+  let transactions = [];
+
+  while (transactions.length < count && latestBlock >= 0) {
+      const block = await web3.eth.getBlock(latestBlock, true); // Fetch full transactions
+      block.transactions.forEach((tx) => {
+          if (tx.from.toLowerCase() === address.toLowerCase() || 
+              tx.to?.toLowerCase() === address.toLowerCase()) {
+              transactions.push(tx);
+          }
+      });
+      latestBlock--;
+  }
+
+  console.log(`Last ${count} transactions:`, transactions.slice(0, count));
+}
 
 // Get keys list
 app.get("/api/keys/all", (req, res) => {
@@ -159,20 +183,21 @@ app.post("/api/tx/generator", (req, res) => {
   newNonce = req.body.newNonce;
   toAddr = req.body.toAddr.trim();
   value = req.body.value;
-
+  let mID = '101564'; // ID from pkcs11-tool output
   //Get the Private key
-  const allPkeys = session.find({ class: graphene.ObjectClass.PRIVATE_KEY });
-  for (i = 0; i < allPkeys.length; i++) {
-    if (
-      allPkeys.items(i).getAttribute({ label: null }).label == "EthreAddrees1"
-    ) {
-      Pkeys = allPkeys.items(i);
-      break;
-    }
-  }
-
+  let hsmPvKeys = session.find({
+    class: graphene.ObjectClass.PRIVATE_KEY,
+    id: Buffer.from(mID, 'hex'),
+  });
+  // the HSM Private Key Instance (do not contain the private key value)
+  let Pkeys = hsmPvKeys.items(0);
   //First sign : sign the ethreum address of the sender
   encoded_msg = EthAddr;
+
+  // console.log last 10 transactions of EthAddr
+  getLastTransactions(EthAddr, 10);
+
+
   let msgHash = util.keccak(encoded_msg); // msg to be signed is the generated ethereum address
   addressSign = calculateEthereumSig(msgHash, EthAddr, Pkeys);
 
@@ -188,8 +213,20 @@ app.post("/api/tx/generator", (req, res) => {
     s: addressSign.s, // using s from the first signature
     v: addressSign.v,
   };
-  const tx = new EthereumTx(txParams, { chain: "rinkeby" });
+
+  console.log(txParams);
+  
+  const customChain = {
+    name: 'customchain1981',
+    chainId: 1981,
+    networkId: 1981,
+    comment: 'My Custom Chain',
+  };
+
+  const tx = new EthereumTx(txParams, customChain);
+
   msgHash = tx.hash(false);
+
 
   //Second sign: sign the raw transactions
   const txSig = calculateEthereumSig(msgHash, EthAddr, Pkeys);
@@ -230,23 +267,30 @@ const calculateEthereumSig = (msgHash, EthreAddr, privateKey) => {
   ///////////////////////////////////////////////////////////////////////////////////////////////
   // Contiue Signing until find s < (secp256k1.size/2)
   ///////////////////////////////////////////////////////////////////////////////////////////////
-  const flag = true;
+  // Continue signing until find s < (secp256k1.size/2)
+  let flag = true;
+  let tempSig;
+
+  // Not all EC signature is a valid signature
   while (flag) {
-    const sign = session.createSign("ECDSA", privateKey);
-    const tempsig = sign.once(msgHash);
-    ss = tempsig.slice(32, 64);
-    s_value = new BigNumber(ss.toString("hex"), 16);
-    secp256k1N = new BigNumber(
-      "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+    
+    const sign = session.createSign('ECDSA', privateKey);
+    tempSig = sign.once(msgHash);
+    const _s = tempSig.slice(32, 64);
+    const sValue = new BigNumber(_s.toString('hex'), 16); // Hex
+    const secp256k1N = new BigNumber(
+      'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
       16
-    );
-    secp256k1halfN = secp256k1N.dividedBy(new BigNumber(2));
-    if (s_value.isLessThan(secp256k1halfN)) flag = false;
+    ); // Max value on the curve
+    const secp256k1halfN = secp256k1N.div(new BigNumber(2));
+    if (sValue.lt(secp256k1halfN)) {
+      flag = false;
+    }
   }
 
   const rs = {
-    r: tempsig.slice(0, 32),
-    s: tempsig.slice(32, 64),
+    r: tempSig.slice(0, 32),
+    s: tempSig.slice(32, 64),
   };
   let v = 27;
   let pubKey = util.ecrecover(util.toBuffer(msgHash), v, rs.r, rs.s);
